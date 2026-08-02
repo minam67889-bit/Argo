@@ -32,27 +32,184 @@ class ToolCall:
 
 
 def _parse_args(s: str) -> Dict[str, Any]:
-    """Parse a JSON string into a dict. Be tolerant."""
+    """Parse a JSON string into a dict. Be tolerant of common LLM mistakes.
+
+    Common issues with model output:
+    1. Single quotes instead of double: {"path": 'add.py'}
+    2. Unescaped quotes inside strings: {"content": "if __name__ == '__main__':"}
+    3. Trailing commas, missing braces
+    4. Newlines and tabs as literal \n / \t in JSON-escaped form
+    """
     if not s:
         return {}
     s = s.strip()
     s = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", s, flags=re.MULTILINE).strip()
+
+    # Strategy 1: standard json parse
     try:
         obj = json.loads(s)
         if isinstance(obj, dict):
             return obj
     except json.JSONDecodeError:
         pass
-    # Find first { ... } block (greedy across newlines)
+
+    # Strategy 2: extract { ... } block and try various fixes
     m = re.search(r"\{[\s\S]*\}", s)
     if m:
+        block = m.group(0)
+        # Try original
         try:
-            obj = json.loads(m.group(0))
+            obj = json.loads(block)
             if isinstance(obj, dict):
                 return obj
         except json.JSONDecodeError:
             pass
-    return {"raw_input": s}
+
+        # Try with quote-fix
+        fixed = _fix_json_quotes(block)
+        try:
+            obj = json.loads(fixed)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+        # Try replacing unescaped single quotes in double-quoted strings
+        try:
+            obj = _parse_loose_json(block)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    # Strategy 3: try ast.literal_eval as last resort (handles Python-style strings)
+    try:
+        import ast
+        obj = ast.literal_eval(s)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    # Strategy 4: regex-based key extraction (very robust)
+    return _extract_key_values(s)
+
+
+def _parse_loose_json(s: str) -> Any:
+    """Parse JSON that's slightly malformed (e.g. missing quotes around keys).
+
+    Only handles objects for our use case.
+    """
+    # Find all "key": value pairs (or 'key': value)
+    result = {}
+    # Match: "key": "value" or "key": number or "key": true/false
+    pattern = r'["\']?([\w_]+)["\']?\s*:\s*("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|true|false|null|[\d\.\-]+|\[[^\]]*\])'
+    for m in re.finditer(pattern, s):
+        key = m.group(1)
+        raw = m.group(2)
+        if raw.startswith('"') or raw.startswith("'"):
+            # String value
+            quote = raw[0]
+            value = raw[1:-1]
+            # Unescape
+            try:
+                # Use json to unescape properly
+                value = json.loads('"' + value.replace('"', '\\"') + '"')
+            except Exception:
+                pass
+        elif raw == "true":
+            value = True
+        elif raw == "false":
+            value = False
+        elif raw == "null":
+            value = None
+        elif raw.startswith("["):
+            try:
+                value = json.loads(raw)
+            except Exception:
+                value = raw
+        else:
+            # Number
+            try:
+                value = int(raw) if "." not in raw else float(raw)
+            except ValueError:
+                value = raw
+        result[key] = value
+    if not result:
+        raise ValueError("No key-value pairs found")
+    return result
+
+
+def _extract_key_values(s: str) -> Dict[str, Any]:
+    """Last-resort: extract key-value pairs using regex even from broken JSON."""
+    result = {}
+    # Match "key": "value" or "key": value
+    # Handle multi-line values that contain embedded quotes by being greedy
+    pattern = r'["\']([\w_]+)["\']\s*:\s*("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')'
+    for m in re.finditer(pattern, s):
+        key = m.group(1)
+        raw = m.group(2)
+        quote = raw[0]
+        value = raw[1:-1]
+        # Try to unescape JSON-style
+        try:
+            if quote == '"':
+                value = json.loads('"' + value + '"')
+            else:
+                # Single-quoted Python string - use ast
+                import ast
+                value = ast.literal_eval(raw)
+        except Exception:
+            # Manual unescape
+            value = value.replace('\\n', '\n').replace('\\t', '\t').replace("\\'", '"').replace("\\\\", "\\")
+        result[key] = value
+    if not result:
+        result["raw_input"] = s
+    return result
+
+
+def _fix_json_quotes(s: str) -> str:
+    """Fix Python single quotes inside JSON double-quoted strings.
+
+    Models sometimes output Python-style strings with single quotes
+    inside JSON values, e.g. {"content": "if __name__ == '__main__':"}.
+    This is invalid JSON. We walk through the string and convert
+    single quotes to escaped double quotes when inside a JSON string.
+    """
+    out = []
+    in_string = False
+    escape_next = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if escape_next:
+            out.append(ch)
+            escape_next = False
+        elif ch == "\\":
+            out.append(ch)
+            escape_next = True
+        elif ch == '"':
+            if not in_string:
+                in_string = True
+                out.append(ch)
+            else:
+                # Could be end of string, or a stray quote we should escape
+                j = i + 1
+                while j < len(s) and s[j] in " \t\n\r":
+                    j += 1
+                if j < len(s) and s[j] in ",}]: ":
+                    in_string = False
+                    out.append(ch)
+                else:
+                    out.append('\\"')
+            i += 1
+            continue
+        elif ch == "'" and in_string:
+            out.append('\\"')
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _json_block_with_tool_name(block: str) -> Optional[ToolCall]:
