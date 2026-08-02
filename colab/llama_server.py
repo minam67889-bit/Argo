@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tiny OpenAI-compatible server around llama-cpp-python.
 
-Designed for Google Colab: uses prebuilt wheels (no compile), runs on GPU.
+Designed for Google Colab T4: uses prebuilt wheels (no compile), runs on GPU.
 Exposes /v1/chat/completions and /v1/models for Argo (and any OpenAI client).
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pydantic import BaseModel
 import uvicorn
 
 # Load model once at startup
-# Free VRAM from any previous model (e.g. the GPU sanity check)
+# Free VRAM from any previous model
 try:
     import gc
     gc.collect()
@@ -31,14 +31,13 @@ try:
         torch.cuda.synchronize()
 except Exception:
     pass
-import time as _time
-_time.sleep(1)  # let the OS settle
 
 from llama_cpp import Llama
 
+# Defaults: 8K context fits Q4_K_M 14B on T4 (16GB) without OOM.
 MODEL_PATH = os.environ.get("MODEL_PATH", "/content/models/qwen3-14b-abliterated.Q4_K_M.gguf")
-N_CTX = int(os.environ.get("N_CTX", "12288"))
-N_GPU_LAYERS = int(os.environ.get("N_GPU_LAYERS", "-1"))  # -1 = all on GPU
+N_CTX = int(os.environ.get("N_CTX", "8192"))
+N_GPU_LAYERS = int(os.environ.get("N_GPU_LAYERS", "-1"))
 CHAT_FORMAT = os.environ.get("CHAT_FORMAT", "chatml")
 PORT = int(os.environ.get("LLAMA_PORT", "8080"))
 HOST = os.environ.get("LLAMA_HOST", "127.0.0.1")
@@ -46,6 +45,8 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "qwen3-14b-abliterated")
 
 print(f"[server] loading {MODEL_PATH} (n_ctx={N_CTX}, n_gpu_layers={N_GPU_LAYERS})...", flush=True)
 t0 = time.time()
+
+# Conservative settings for T4: smaller batch, no flash_attn (T4 has issues with it)
 LLM = Llama(
     model_path=MODEL_PATH,
     n_ctx=N_CTX,
@@ -53,10 +54,11 @@ LLM = Llama(
     chat_format=CHAT_FORMAT,
     verbose=False,
     n_threads=int(os.environ.get("N_THREADS", "4")),
-    n_batch=int(os.environ.get("N_BATCH", "512")),
+    n_batch=int(os.environ.get("N_BATCH", "256")),  # 256 safer than 512 on T4
     use_mmap=True,
     use_mlock=False,
-    flash_attn=True,
+    # Don't use flash_attn on T4 — can cause issues. Use offload_kqv instead.
+    # flash_attn is for newer GPUs (H100, etc.)
 )
 print(f"[server] model loaded in {time.time()-t0:.0f}s", flush=True)
 
@@ -134,7 +136,6 @@ def chat_completions(req: ChatRequest):
             stream=True,
         )
         for chunk in stream:
-            # Convert to OpenAI streaming format
             choice = chunk.get("choices", [{}])[0]
             delta = choice.get("delta", {})
             content = delta.get("content", "")
@@ -168,7 +169,6 @@ if __name__ == "__main__":
         s.close()
         chosen_port = PORT
     except OSError:
-        # Find a free port in range
         for p in range(PORT + 1, PORT + 100):
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -176,16 +176,12 @@ if __name__ == "__main__":
                 s.close()
                 chosen_port = p
                 print(f"[server] port {PORT} busy, using {p} instead", flush=True)
-                # Save the actual port for downstream consumers
-                with open('/content/llama.port', 'w') as f:
-                    f.write(str(p))
                 break
             except OSError:
                 continue
         else:
             print(f"[server] no free port found near {PORT}!", flush=True)
             raise SystemExit(1)
-    else:
-        with open('/content/llama.port', 'w') as f:
-            f.write(str(chosen_port))
+    with open('/content/llama.port', 'w') as f:
+        f.write(str(chosen_port))
     uvicorn.run(app, host=HOST, port=chosen_port, log_level="warning")
