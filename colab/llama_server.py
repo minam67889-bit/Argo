@@ -18,6 +18,22 @@ from pydantic import BaseModel
 import uvicorn
 
 # Load model once at startup
+# Free VRAM from any previous model (e.g. the GPU sanity check)
+try:
+    import gc
+    gc.collect()
+except Exception:
+    pass
+try:
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+except Exception:
+    pass
+import time as _time
+_time.sleep(1)  # let the OS settle
+
 from llama_cpp import Llama
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/content/models/qwen3-14b-abliterated.Q4_K_M.gguf")
@@ -144,4 +160,32 @@ def chat_completions(req: ChatRequest):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    # Try the requested port; if busy, find a free one
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((HOST, PORT))
+        s.close()
+        chosen_port = PORT
+    except OSError:
+        # Find a free port in range
+        for p in range(PORT + 1, PORT + 100):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind((HOST, p))
+                s.close()
+                chosen_port = p
+                print(f"[server] port {PORT} busy, using {p} instead", flush=True)
+                # Save the actual port for downstream consumers
+                with open('/content/llama.port', 'w') as f:
+                    f.write(str(p))
+                break
+            except OSError:
+                continue
+        else:
+            print(f"[server] no free port found near {PORT}!", flush=True)
+            raise SystemExit(1)
+    else:
+        with open('/content/llama.port', 'w') as f:
+            f.write(str(chosen_port))
+    uvicorn.run(app, host=HOST, port=chosen_port, log_level="warning")
