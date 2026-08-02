@@ -184,4 +184,8 @@ if __name__ == "__main__":
             raise SystemExit(1)
     with open('/content/llama.port', 'w') as f:
         f.write(str(chosen_port))
+    # Also write our PID so callers can kill us precisely (avoids pkill -f pattern issues)
+    with open('/content/llama.pid', 'w') as f:
+        f.write(str(os.getpid()))
+    print(f"[server] PID: {os.getpid()}, port: {chosen_port}", flush=True)
     uvicorn.run(app, host=HOST, port=chosen_port, log_level="warning")
