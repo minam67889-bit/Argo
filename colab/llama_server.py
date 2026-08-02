@@ -38,7 +38,7 @@ from llama_cpp import Llama
 MODEL_PATH = os.environ.get("MODEL_PATH", "/content/models/qwen3-14b-abliterated.Q4_K_M.gguf")
 N_CTX = int(os.environ.get("N_CTX", "8192"))
 N_GPU_LAYERS = int(os.environ.get("N_GPU_LAYERS", "-1"))
-CHAT_FORMAT = os.environ.get("CHAT_FORMAT", "chatml")
+CHAT_FORMAT = os.environ.get("CHAT_FORMAT", "chatml-function-calling")
 PORT = int(os.environ.get("LLAMA_PORT", "8080"))
 HOST = os.environ.get("LLAMA_HOST", "127.0.0.1")
 MODEL_NAME = os.environ.get("MODEL_NAME", "qwen3-14b-abliterated")

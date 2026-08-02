@@ -57,11 +57,20 @@ for step in 1..MAX_STEPS:
   ↓
   call LLM (streaming or non-streaming)
   ↓
-  parse response:
-    - native tool_calls (OpenAI-style) → ToolCall
-    - or <tool_call name="X">{...}</tool_call> in text
-    - or ```json { "name": ..., "arguments": ... }```
-    - or ReAct: Action: / Action Input:
+  parse response (parser tries 9 formats in order):
+    1. <tool_call name="X">{...}</tool_call>           (Qwen-style XML, closed)
+    2. <|tool_call name="X">{...}</tool_call|>           (Mistral/Llama-3 pipe-style, closed)
+    3. <|tool_call name="X">...                          (pipe-style, unclosed)
+    4. <tool_call name="X">...  (unclosed, until </think>)
+    5. <tool_call>{json}</tool_call>                  (no name attribute, Qwen3 alt)
+    6. <|tool_call|>{json}</tool_call|>                 (pipe-style no name, closed)
+    7. <|tool_call|>{json}<|tool_call|>                 (pipe-style no name, unclosed)
+    8. <tool_code>...```json```...</tool_code>          (multi-call wrapper)
+    9. ```json { "name": ..., "arguments": ... }```     (generic fenced)
+   10. ReAct: Action: / Action Input:
+   11. Bare JSON with "name"/"arguments" anywhere
+  ↓
+  strip incomplete special tokens (e.g. "<|im_start|>tool_call")
   ↓
   if no tool calls → emit "done", return
   ↓
