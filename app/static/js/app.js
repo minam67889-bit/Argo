@@ -15,6 +15,7 @@
     workspace: '',
     abortController: null,
     streaming: false,
+    pendingFiles: [], // files queued for the next message (uploaded on send)
     settings: {
       base_url: '',
       has_api_key: false,
@@ -352,17 +353,37 @@
     if (state.streaming) return;
     const input = $('#input');
     const text = input.value.trim();
-    if (!text) return;
+    if (!text && state.pendingFiles.length === 0) return;
 
     if (!state.currentChatId) {
       await newChat();
     }
 
+    // Upload any pending files first
+    if (state.pendingFiles.length > 0) {
+      try {
+        setStatus('streaming', 'در حال آپلود فایل…');
+        await uploadPendingFiles();
+      } catch (e) {
+        return; // stop, error already shown
+      }
+    }
+
     input.value = '';
     autoResize();
 
+    // If we have uploaded files but no text, add a placeholder message
+    let content = text;
+    if (!content && state.pendingFiles.some(f => f.status === 'uploaded')) {
+      // Show a placeholder listing the files
+      const names = state.pendingFiles.filter(f => f.status === 'uploaded').map(f => f.name);
+      content = names.length === 1
+        ? `فایل ${names[0]} رو ببین و توضیح بده.`
+        : `این فایل‌ها رو ببین:\n${names.map(n => `- ${n}`).join('\n')}`;
+    }
+
     // Optimistic: add user message to view
-    const userMsg = { role: 'user', content: text, created_at: Date.now() / 1000 };
+    const userMsg = { role: 'user', content: content, created_at: Date.now() / 1000 };
     state.messages.push(userMsg);
     renderMessages();
 
@@ -609,6 +630,86 @@
     i.style.height = Math.min(i.scrollHeight, 240) + 'px';
   }
 
+  // ===== File upload =====
+  function formatSize(bytes) {
+    if (bytes < 1024) return bytes + 'B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'KB';
+    return (bytes / 1024 / 1024).toFixed(1) + 'MB';
+  }
+
+  function renderAttachments() {
+    const wrap = $('#attachments');
+    wrap.innerHTML = '';
+    if (state.pendingFiles.length === 0) {
+      wrap.classList.add('hidden');
+      return;
+    }
+    wrap.classList.remove('hidden');
+    for (const f of state.pendingFiles) {
+      const chip = el('div', { class: 'attachment-chip' + (f.status ? ' ' + f.status : '') },
+        el('span', { class: 'chip-name' }, f.name),
+        el('span', { class: 'chip-size' }, formatSize(f.size)),
+        el('span', { class: 'chip-remove', title: 'حذف' },
+          (() => {
+            const s = el('span');
+            s.innerHTML = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+            return s;
+          })()
+        )
+      );
+      chip.querySelector('.chip-remove').addEventListener('click', () => {
+        state.pendingFiles = state.pendingFiles.filter(x => x !== f);
+        renderAttachments();
+      });
+      wrap.appendChild(chip);
+    }
+  }
+
+  async function uploadPendingFiles() {
+    if (!state.currentChatId || state.pendingFiles.length === 0) return;
+    const fd = new FormData();
+    for (const f of state.pendingFiles) {
+      fd.append('files', f.file);
+    }
+    try {
+      const r = await fetch(`/api/chats/${state.currentChatId}/files`, {
+        method: 'POST',
+        body: fd,
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        throw new Error(t || `HTTP ${r.status}`);
+      }
+      const data = await r.json();
+      // Mark uploaded
+      for (const f of state.pendingFiles) f.status = 'uploaded';
+      renderAttachments();
+      // Clear after 2s
+      setTimeout(() => {
+        state.pendingFiles = [];
+        renderAttachments();
+      }, 1500);
+      return data;
+    } catch (e) {
+      setStatus('error', 'آپلود ناموفق: ' + e.message);
+      throw e;
+    }
+  }
+
+  function addFiles(filesList) {
+    for (const file of filesList) {
+      // Avoid duplicates
+      if (state.pendingFiles.some(f => f.name === file.name && f.size === file.size)) continue;
+      state.pendingFiles.push({
+        name: file.name,
+        size: file.size,
+        file: file,
+        status: '',
+      });
+    }
+    renderAttachments();
+  }
+
   function updateModeUI() {
     $$('.mode-btn').forEach(b => {
       b.classList.toggle('active', b.dataset.mode === state.mode);
@@ -705,6 +806,42 @@
     // Send/Stop
     $('#sendBtn').addEventListener('click', sendMessage);
     $('#stopBtn').addEventListener('click', stopStreaming);
+
+    // File attach
+    $('#attachBtn').addEventListener('click', () => $('#fileInput').click());
+    $('#fileInput').addEventListener('change', (e) => {
+      if (e.target.files && e.target.files.length > 0) {
+        addFiles(e.target.files);
+        e.target.value = ''; // reset so same file can be added again
+      }
+    });
+
+    // Drag & drop on the input area
+    const dropZone = $('#dropZone');
+    ['dragenter', 'dragover'].forEach(ev => {
+      dropZone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropZone.classList.add('dragover');
+      });
+    });
+    ['dragleave', 'drop'].forEach(ev => {
+      dropZone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (ev === 'dragleave' && e.target !== dropZone && dropZone.contains(e.relatedTarget)) return;
+        dropZone.classList.remove('dragover');
+      });
+    });
+    dropZone.addEventListener('drop', (e) => {
+      const files = e.dataTransfer?.files;
+      if (files && files.length > 0) {
+        addFiles(files);
+      }
+    });
+    // Prevent the page from navigating when files are dropped outside the drop zone
+    window.addEventListener('dragover', (e) => e.preventDefault());
+    window.addEventListener('drop', (e) => e.preventDefault());
 
     // Settings
     $('#settingsBtn').addEventListener('click', openSettingsModal);

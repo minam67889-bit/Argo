@@ -748,7 +748,7 @@ pre:hover .copy-btn {
 
 #input {
   width: 100%;
-  padding: 14px 56px 14px 18px;
+  padding: 14px 96px 14px 56px;
   background: transparent;
   border: none;
   resize: none;
@@ -761,6 +761,91 @@ pre:hover .copy-btn {
 
 #input::placeholder {
   color: var(--txt-dim);
+}
+
+.attach-btn {
+  position: absolute;
+  left: 52px;
+  bottom: 8px;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--txt-muted);
+  transition: all var(--transition);
+}
+
+.attach-btn:hover {
+  background: var(--bg-elev-2);
+  color: var(--txt);
+}
+
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 0 4px;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-light);
+  border-radius: 16px;
+  font-size: 12px;
+  color: var(--txt);
+  max-width: 240px;
+}
+
+.attachment-chip .chip-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: ltr;
+}
+
+.attachment-chip .chip-size {
+  color: var(--txt-dim);
+  font-size: 10px;
+  direction: ltr;
+}
+
+.attachment-chip .chip-remove {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: var(--txt-muted);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.attachment-chip .chip-remove:hover {
+  background: var(--error);
+  color: white;
+}
+
+.attachment-chip.uploading {
+  opacity: 0.6;
+}
+
+.attachment-chip.uploaded {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* Drag & drop visual feedback */
+.input-wrap.dragover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 
 .send-btn, .stop-btn {

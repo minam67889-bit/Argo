@@ -50,6 +50,7 @@ class AgentLoop:
         tool_names: Optional[List[str]] = None,
         on_bash_request: Optional[Any] = None,
         model: Optional[str] = None,
+        supports_native_tools: Optional[bool] = None,
     ) -> None:
         self.llm = llm
         self.workdir = workdir
@@ -64,6 +65,8 @@ class AgentLoop:
         self.bash_timeout = bash_timeout or settings.AGENT_BASH_TIMEOUT
         self.on_bash_request = on_bash_request
         self.model = model
+        # If None, we'll auto-detect. If False, we use text-based tool calls only.
+        self.supports_native_tools = supports_native_tools
 
         # History (system + user + assistant + tool results)
         self.messages: List[Dict[str, Any]] = []
@@ -202,19 +205,32 @@ class AgentLoop:
                 "temperature": self.temperature,
                 "max_tokens": self.max_tokens,
             }
-            # Try native tool calling if all tools have valid schemas
-            try:
-                tool_specs = [get_tool(n, ctx).to_openai_schema() for n in self.tool_names]
-                kwargs["tools"] = tool_specs
-                kwargs["tool_choice"] = "auto"
-            except Exception:
-                pass
+            # Only use native tool calling if explicitly enabled (the endpoint must support it)
+            if self.supports_native_tools is True:
+                try:
+                    tool_specs = [get_tool(n, ctx).to_openai_schema() for n in self.tool_names]
+                    kwargs["tools"] = tool_specs
+                    kwargs["tool_choice"] = "auto"
+                except Exception:
+                    pass
 
             try:
                 resp = await self.llm.chat(self.messages, **kwargs)
             except Exception as e:
-                yield AgentEvent("error", {"message": f"LLM error: {e}"})
-                return
+                err_str = str(e)
+                # If the endpoint doesn't support tools, retry without them
+                if "tools" in err_str and "tools" in kwargs:
+                    kwargs.pop("tools", None)
+                    kwargs.pop("tool_choice", None)
+                    self.supports_native_tools = False
+                    try:
+                        resp = await self.llm.chat(self.messages, **kwargs)
+                    except Exception as e2:
+                        yield AgentEvent("error", {"message": f"LLM error: {e2}"})
+                        return
+                else:
+                    yield AgentEvent("error", {"message": f"LLM error: {e}"})
+                    return
 
             # Update token count
             if resp.get("usage"):

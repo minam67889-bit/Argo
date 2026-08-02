@@ -23,7 +23,6 @@ class LLMClient:
         self.base_url = base_url or settings.LLM_BASE_URL
         self.timeout = timeout or settings.LLM_TIMEOUT
         if not self.api_key:
-            # OpenAI SDK requires a non-empty key; use a placeholder for local servers.
             self.api_key = "sk-no-key"
         self._client = AsyncOpenAI(
             api_key=self.api_key,
@@ -39,25 +38,52 @@ class LLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         stream: bool = False,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Non-streaming chat completion. Returns the full message dict."""
+        """Non-streaming chat completion. Returns the full message dict.
+
+        tools: list of OpenAI-format tool schemas (function calling).
+        tool_choice: "auto" | "none" | {"type": "function", "function": {"name": ...}}
+        """
+        kwargs: Dict[str, Any] = {
+            "model": model or settings.LLM_MODEL,
+            "messages": messages,
+            "temperature": temperature if temperature is not None else settings.AGENT_TEMPERATURE,
+            "max_tokens": max_tokens or settings.AGENT_MAX_TOKENS,
+            "stream": False,
+        }
+        if tools is not None:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+
         try:
-            resp = await self._client.chat.completions.create(
-                model=model or settings.LLM_MODEL,
-                messages=messages,
-                temperature=temperature if temperature is not None else settings.AGENT_TEMPERATURE,
-                max_tokens=max_tokens or settings.AGENT_MAX_TOKENS,
-                stream=False,
-            )
+            resp = await self._client.chat.completions.create(**kwargs)
         except OpenAIError as e:
             raise RuntimeError(f"LLM request failed: {e}") from e
 
         msg = resp.choices[0].message
+        # Extract native tool_calls if present
+        tool_calls = None
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            tool_calls = []
+            for tc in msg.tool_calls:
+                tool_calls.append({
+                    "id": getattr(tc, "id", None),
+                    "type": getattr(tc, "type", "function"),
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    }
+                })
+
         return {
             "role": msg.role,
             "content": msg.content or "",
             "reasoning": getattr(msg, "reasoning_content", None),
             "finish_reason": resp.choices[0].finish_reason,
+            "tool_calls": tool_calls,
             "usage": {
                 "prompt_tokens": resp.usage.prompt_tokens if resp.usage else 0,
                 "completion_tokens": resp.usage.completion_tokens if resp.usage else 0,
@@ -71,23 +97,32 @@ class LLMClient:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Streaming chat completion. Yields token deltas.
 
         Yields dicts like:
           {"type": "delta", "content": "..."}
           {"type": "reasoning", "content": "..."}
+          {"type": "tool_call", "name": "...", "arguments": {...}}
           {"type": "done", "finish_reason": "...", "usage": {...}}
           {"type": "error", "message": "..."}
         """
+        kwargs: Dict[str, Any] = {
+            "model": model or settings.LLM_MODEL,
+            "messages": messages,
+            "temperature": temperature if temperature is not None else settings.AGENT_TEMPERATURE,
+            "max_tokens": max_tokens or settings.AGENT_MAX_TOKENS,
+            "stream": True,
+        }
+        if tools is not None:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+
         try:
-            stream = await self._client.chat.completions.create(
-                model=model or settings.LLM_MODEL,
-                messages=messages,
-                temperature=temperature if temperature is not None else settings.AGENT_TEMPERATURE,
-                max_tokens=max_tokens or settings.AGENT_MAX_TOKENS,
-                stream=True,
-            )
+            stream = await self._client.chat.completions.create(**kwargs)
             async for chunk in stream:
                 if not chunk.choices:
                     continue
@@ -97,6 +132,24 @@ class LLMClient:
                     yield {"type": "reasoning", "content": delta.reasoning_content}
                 if delta.content:
                     yield {"type": "delta", "content": delta.content}
+                # Native tool calls in streaming
+                if getattr(delta, "tool_calls", None):
+                    for tc in delta.tool_calls:
+                        try:
+                            args = tc.function.arguments
+                            if isinstance(args, str):
+                                try:
+                                    args = json.loads(args) if args else {}
+                                except Exception:
+                                    args = {"raw": args}
+                        except Exception:
+                            args = {}
+                        yield {
+                            "type": "tool_call",
+                            "name": tc.function.name or "",
+                            "arguments": args or {},
+                            "id": getattr(tc, "id", None),
+                        }
                 if finish:
                     yield {
                         "type": "done",
@@ -120,10 +173,8 @@ def safe_json_loads(text: str) -> Optional[Any]:
     if not text:
         return None
     text = text.strip()
-    # Strip code fences
     if text.startswith("```"):
         lines = text.split("\n")
-        # drop first ```json / ``` and last ```
         if lines and lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].strip() == "```":

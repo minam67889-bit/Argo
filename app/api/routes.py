@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -25,6 +25,36 @@ from app.core.llm import LLMClient
 
 
 router = APIRouter()
+
+
+# ---- File upload helpers ----
+
+# Allowed file extensions (text + code + zip + common docs)
+ALLOWED_EXTS = {
+    # Text
+    ".txt", ".md", ".rst", ".log",
+    # Code
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+    ".html", ".htm", ".css", ".scss", ".sass", ".less",
+    ".xml", ".svg", ".sql",
+    ".sh", ".bash", ".zsh", ".fish",
+    ".java", ".kt", ".scala", ".groovy",
+    ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx",
+    ".go", ".rs", ".rb", ".php", ".pl", ".pm",
+    ".swift", ".m", ".mm", ".dart", ".lua", ".r",
+    # Archives
+    ".zip",
+}
+
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB per file
+
+
+def get_chat_uploads_dir(chat_id: str) -> Path:
+    """Each chat has its own upload directory."""
+    d = settings.ARGO_DB.parent / "uploads" / chat_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 # ---- Health & info ----
@@ -155,11 +185,49 @@ async def api_send_message(chat_id: str, body: SendMessageRequest, request: Requ
     if not workdir.exists():
         workdir.mkdir(parents=True, exist_ok=True)
 
+    # Link uploaded files into the workdir under "uploads/"
+    # so the agent can access them via bash/read_file.
+    uploads_dir = get_chat_uploads_dir(chat_id)
+    workdir_uploads = workdir / "uploads"
+    try:
+        if uploads_dir.exists() and any(uploads_dir.iterdir()):
+            workdir_uploads.mkdir(parents=True, exist_ok=True)
+            # Symlink each file (so updates to uploads are visible)
+            for src in uploads_dir.iterdir():
+                if src.is_file():
+                    link = workdir_uploads / src.name
+                    if link.exists() or link.is_symlink():
+                        link.unlink()
+                    link.symlink_to(src.resolve())
+    except OSError:
+        # Best effort — uploads may be on a different filesystem (Drive)
+        # In that case, just copy
+        try:
+            workdir_uploads.mkdir(parents=True, exist_ok=True)
+            for src in uploads_dir.iterdir():
+                if src.is_file():
+                    link = workdir_uploads / src.name
+                    if link.exists():
+                        link.unlink()
+                    import shutil
+                    shutil.copy2(src, link)
+        except Exception:
+            pass
+
     # Save the user message immediately
     user_msg = storage.add_message(chat_id, "user", body.content)
 
     # Build the agent loop with full history
     client = LLMClient()
+    # Detect if endpoint supports native tools. Local llama.cpp / ollama (older) don't.
+    base = settings.LLM_BASE_URL.lower()
+    supports_native_tools = None  # auto-detect on first error
+    if any(host in base for host in ("openrouter.ai", "api.openai.com", "api.deepseek.com")):
+        supports_native_tools = True
+    elif "localhost" in base or "127.0.0.1" in base:
+        # Local servers typically don't support tools (llama.cpp, ollama)
+        supports_native_tools = False
+
     agent = AgentLoop(
         llm=client,
         workdir=workdir,
@@ -169,6 +237,7 @@ async def api_send_message(chat_id: str, body: SendMessageRequest, request: Requ
         max_tokens=body.max_tokens,
         auto_approve=body.auto_approve if body.auto_approve is not None else settings.AGENT_AUTO_APPROVE,
         bash_timeout=settings.AGENT_BASH_TIMEOUT,
+        supports_native_tools=supports_native_tools,
     )
     # Load prior messages from DB (skip the one we just added; we'll add it manually)
     prior = storage.list_messages(chat_id)[:-1]  # exclude the just-added user msg
@@ -314,3 +383,118 @@ async def api_browse_workspace(path: str = "."):
         return {"path": str(p), "entries": entries}
     except PermissionError as e:
         raise HTTPException(403, str(e))
+
+
+# ---- File upload ----
+
+@router.post("/api/chats/{chat_id}/files")
+async def api_upload_files(chat_id: str, files: List[UploadFile] = File(...)):
+    """Upload one or more files to this chat. Files are saved under
+    data/uploads/{chat_id}/ and become available to the agent as part
+    of its workspace (via symlink or copy).
+    """
+    chat = storage.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(404, "chat not found")
+
+    uploads_dir = get_chat_uploads_dir(chat_id)
+    saved = []
+    errors = []
+
+    for f in files:
+        if not f.filename:
+            continue
+        ext = Path(f.filename).suffix.lower()
+        if ext not in ALLOWED_EXTS:
+            errors.append({"filename": f.filename, "error": f"extension {ext} not allowed"})
+            continue
+
+        # Sanitize filename — strip path components
+        safe_name = Path(f.filename).name
+        # Avoid collisions
+        dest = uploads_dir / safe_name
+        if dest.exists():
+            stem, suffix = dest.stem, dest.suffix
+            i = 1
+            while dest.exists():
+                dest = uploads_dir / f"{stem}_{i}{suffix}"
+                i += 1
+
+        try:
+            content = await f.read()
+            if len(content) > MAX_FILE_SIZE:
+                errors.append({"filename": safe_name, "error": f"too large (>{MAX_FILE_SIZE//1024//1024}MB)"})
+                continue
+            dest.write_bytes(content)
+            saved.append({
+                "filename": dest.name,
+                "size": len(content),
+                "path": str(dest.relative_to(settings.ARGO_DB.parent)),
+            })
+        except Exception as e:
+            errors.append({"filename": safe_name, "error": str(e)})
+
+    return {"saved": saved, "errors": errors}
+
+
+@router.get("/api/chats/{chat_id}/files")
+async def api_list_files(chat_id: str):
+    """List files uploaded to this chat."""
+    chat = storage.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(404, "chat not found")
+    uploads_dir = get_chat_uploads_dir(chat_id)
+    if not uploads_dir.exists():
+        return {"files": []}
+    files = []
+    for p in sorted(uploads_dir.iterdir(), key=lambda x: x.name.lower()):
+        if p.is_file():
+            try:
+                st = p.stat()
+                files.append({
+                    "filename": p.name,
+                    "size": st.st_size,
+                    "modified": st.st_mtime,
+                })
+            except OSError:
+                continue
+    return {"files": files}
+
+
+@router.delete("/api/chats/{chat_id}/files/{filename}")
+async def api_delete_file(chat_id: str, filename: str):
+    """Delete a single uploaded file."""
+    chat = storage.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(404, "chat not found")
+    uploads_dir = get_chat_uploads_dir(chat_id)
+    target = (uploads_dir / filename).resolve()
+    try:
+        target.relative_to(uploads_dir.resolve())
+    except ValueError:
+        raise HTTPException(400, "invalid filename")
+    if not target.exists():
+        raise HTTPException(404, "file not found")
+    target.unlink()
+    return {"ok": True}
+
+
+@router.get("/api/chats/{chat_id}/files/{filename}/content")
+async def api_get_file_content(chat_id: str, filename: str):
+    """Read a file's text content (for display in the UI)."""
+    chat = storage.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(404, "chat not found")
+    uploads_dir = get_chat_uploads_dir(chat_id)
+    target = (uploads_dir / filename).resolve()
+    try:
+        target.relative_to(uploads_dir.resolve())
+    except ValueError:
+        raise HTTPException(400, "invalid filename")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "file not found")
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        raise HTTPException(500, f"failed to read: {e}")
+    return {"filename": filename, "content": content, "size": len(content)}
