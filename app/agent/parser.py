@@ -1,11 +1,14 @@
 """Robust tool-call parser.
 
 Tries multiple formats, in order of preference:
-  1. <tool_call name="...">{"..."}</tool_call>  (Qwen-style XML)
-  2. ```json { "name": "...", "arguments": {...} }```  (generic)
-  3. <tool_code>...```json name/arguments```...</tool_code>  (multi-call)
-  4. ReAct: Action: name \\\\n Action Input: {json}
-  5. Bare JSON objects with "name"/"arguments" or "name"/"args"
+  1. <tool_call name="...">{...}</tool_call>  (Qwen-style XML, with optional closing)
+  2. <tool_call name="...">{...} </tool_call>```
+
+  3. ```json { "name": "...", "arguments": {...} }```  (generic)
+  4. <tool_code>...```json name/arguments```...</tool_code>  (multi-call)
+  5. ReAct: Action: name \\n Action Input: {json}
+  6. Bare JSON objects with "name"/"arguments" or "name"/"args"
+  7. Qwen3 thinking style: <tool_call>name\n{...} (no closing, until end)
 
 We never silently drop calls — we always log what we couldn't parse and
 return what we found.
@@ -18,30 +21,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# Regex helpers
-RE_XML_TOOL_CALL = re.compile(
-    r'<tool_call\s+name="([^"]+)"\s*>([\s\S]*?)</tool_call>',
-    re.IGNORECASE,
-)
-RE_FENCE_JSON = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
-RE_REACT_ACTION = re.compile(
-    r"^\s*Action\s*:\s*([^\n]+)\s*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-RE_REACT_INPUT = re.compile(
-    r"^\s*Action\s*Input\s*:\s*([\s\S]*?)(?=\n\s*(?:Action|Observation|Thought|Final|###)|\Z)",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-# Strip common markdown formatting
-_FENCE_OPEN = re.compile(r"^```[a-zA-Z]*\s*|\s*```$", re.MULTILINE)
-
-
 @dataclass
 class ToolCall:
     name: str
     arguments: Dict[str, Any]
-    # The original text that produced this call (for debugging)
     raw: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -53,16 +36,14 @@ def _parse_args(s: str) -> Dict[str, Any]:
     if not s:
         return {}
     s = s.strip()
-    # Strip code fences
-    s = _FENCE_OPEN.sub("", s).strip()
-    # Try direct parse
+    s = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", s, flags=re.MULTILINE).strip()
     try:
         obj = json.loads(s)
         if isinstance(obj, dict):
             return obj
     except json.JSONDecodeError:
         pass
-    # Find first { ... } block
+    # Find first { ... } block (greedy across newlines)
     m = re.search(r"\{[\s\S]*\}", s)
     if m:
         try:
@@ -92,17 +73,53 @@ def _json_block_with_tool_name(block: str) -> Optional[ToolCall]:
     return ToolCall(name=name, arguments=args, raw=block)
 
 
+# XML <tool_call name="X">{...}</tool_call> — with closing
+RE_XML_TOOL_CALL_CLOSED = re.compile(
+    r'<tool_call\s+name="([^"]+)"\s*>([\s\S]*?)</tool_call\s*>',
+    re.IGNORECASE,
+)
+
+# XML <tool_call name="X"> — until </think> or end (Qwen3 common pattern)
+RE_XML_TOOL_CALL_UNCLOSED = re.compile(
+    r'<tool_call\s+name="([^"]+)"\s*>([\s\S]*?)(?:</tool_call\s*>|</think>|###\s*Observation)',
+    re.IGNORECASE,
+)
+
+# XML <tool_call> (no name attr, just the JSON) — Qwen3 alternative
+RE_XML_TOOL_CALL_NONAME = re.compile(
+    r'<tool_call\s*>([\s\S]*?)(?:</tool_call\s*>|</think>|###\s*Observation)',
+    re.IGNORECASE,
+)
+
+# ```json { "name": "X", "arguments": {...} }```
+RE_FENCE_JSON = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
+
+# <tool_code>...```json```...</tool_code>
+RE_TOOL_CODE = re.compile(
+    r"<tool_code\s*>([\s\S]*?)</tool_code\s*>",
+    re.IGNORECASE,
+)
+
+# ReAct format
+RE_REACT_ACTION = re.compile(
+    r"^\s*Action\s*:\s*([^\n]+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+RE_REACT_INPUT = re.compile(
+    r"^\s*Action\s*Input\s*:\s*([\s\S]*?)(?=\n\s*(?:Action|Observation|Thought|Final|###)|\Z)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 def _parse_react(text: str) -> List[ToolCall]:
     """Parse ReAct format: Action: name\\nAction Input: {json}."""
     calls = []
     actions = list(RE_REACT_ACTION.finditer(text))
     for m in actions:
         name = m.group(1).strip()
-        # Strip surrounding punctuation
         name = name.strip("`\"' ")
         if not name:
             continue
-        # Find the next Action Input after this Action
         rest = text[m.end():]
         inp = RE_REACT_INPUT.match(rest)
         if not inp:
@@ -129,58 +146,107 @@ def parse_tool_calls(
 
     calls: List[ToolCall] = []
     consumed_spans: List[Tuple[int, int]] = []
+    used: set = set()  # track which regex already matched a span
 
-    # --- 1) XML <tool_call name="X">{...}</tool_call> ---
-    for m in RE_XML_TOOL_CALL.finditer(text):
+    def _try_add(tc: ToolCall, span: Tuple[int, int], tag: str) -> None:
+        if tc is None:
+            return
+        if valid_tools is not None and tc.name not in valid_tools:
+            return
+        # Don't add duplicate (name, args) pairs
+        for c in calls:
+            if c.name == tc.name and c.arguments == tc.arguments:
+                return
+        calls.append(tc)
+        consumed_spans.append(span)
+        used.add(tag)
+
+    # --- 1) XML <tool_call name="X">{...}</tool_call> (closed) ---
+    for m in RE_XML_TOOL_CALL_CLOSED.finditer(text):
         name = m.group(1).strip()
         args = _parse_args(m.group(2))
-        if valid_tools is None or name in valid_tools:
-            calls.append(ToolCall(name=name, arguments=args, raw=m.group(0)))
-            consumed_spans.append(m.span())
+        tc = ToolCall(name=name, arguments=args, raw=m.group(0))
+        _try_add(tc, m.span(), "xml_closed")
 
-    # --- 2) ```json { "name": "X", "arguments": {...} }``` ---
+    # --- 2) XML <tool_call name="X">...  (unclosed, until </think>) ---
+    if not calls:
+        for m in RE_XML_TOOL_CALL_UNCLOSED.finditer(text):
+            name = m.group(1).strip()
+            args = _parse_args(m.group(2))
+            tc = ToolCall(name=name, arguments=args, raw=m.group(0))
+            _try_add(tc, m.span(), "xml_unclosed")
+
+    # --- 3) XML <tool_call>{json}</tool_call> (no name attribute) ---
+    if not calls:
+        for m in RE_XML_TOOL_CALL_NONAME.finditer(text):
+            tc = _json_block_with_tool_name(m.group(1))
+            _try_add(tc, m.span(), "xml_noname")
+
+    # --- 4) <tool_code>...```json name/arguments```...</tool_code> ---
+    if not calls:
+        for m in RE_TOOL_CODE.finditer(text):
+            inner = m.group(1)
+            for jm in RE_FENCE_JSON.finditer(inner):
+                tc = _json_block_with_tool_name(jm.group(1))
+                if tc is not None:
+                    _try_add(tc, (m.start() + jm.start(), m.start() + jm.end()), "tool_code")
+                    break
+
+    # --- 5) ```json { "name": ..., "arguments": ... }``` (fenced) ---
     if not calls:
         for m in RE_FENCE_JSON.finditer(text):
-            block = m.group(1)
-            tc = _json_block_with_tool_name(block)
-            if tc and (valid_tools is None or tc.name in valid_tools):
-                calls.append(tc)
-                consumed_spans.append(m.span())
+            tc = _json_block_with_tool_name(m.group(1))
+            _try_add(tc, m.span(), "fence_json")
 
-    # --- 3) ReAct format (Action:/Action Input:) ---
+    # --- 6) ReAct format (Action: ... Action Input: ...) ---
     if not calls:
-        react_calls = _parse_react(text)
-        for tc in react_calls:
-            if valid_tools is None or tc.name in valid_tools:
-                calls.append(tc)
-        # Don't bother stripping ReAct lines — they're often intermixed with thought.
+        for tc in _parse_react(text):
+            _try_add(tc, (0, 0), "react")  # span doesn't matter for text-based
 
-    # Compute remaining text
+    # --- 7) Final fallback: find a JSON object with "name" anywhere in text ---
+    if not calls:
+        for m in re.finditer(r"\{[\s\S]*?\"name\"\s*:\s*\"(\w+)\"[\s\S]*?\"arguments\"\s*:", text):
+            block_start = m.start()
+            # Find matching close brace
+            depth = 0
+            end = block_start
+            for i, ch in enumerate(text[block_start:], start=block_start):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            block = text[block_start:end]
+            tc = _json_block_with_tool_name(block)
+            if tc is not None:
+                _try_add(tc, (block_start, end), "json_anywhere")
+
+    # Compute remaining text (remove consumed spans in reverse to keep indices valid)
     if not consumed_spans:
         remaining = text
     else:
-        # Build text minus consumed spans (in reverse order to keep indices valid)
         consumed_spans.sort()
         remaining = text
         for start, end in reversed(consumed_spans):
             remaining = remaining[:start] + remaining[end:]
     remaining = remaining.strip()
-
     return calls, remaining
 
 
 def format_tool_result(name: str, output: str, error: bool) -> str:
     """Format a tool result for the model's next turn."""
     status = "error" if error else "ok"
-    return f"<tool_result name=\"{name}\" status=\"{status}\">\n{output}\n</tool_result>"
+    return f'<tool_result name="{name}" status="{status}">\n{output}\n</tool_result>'
 
 
 def strip_tool_blocks(text: str) -> str:
     """Remove <tool_call>...</tool_call> blocks and ```json``` tool blocks
-    from a piece of text, leaving the prose for display. Use this when showing
-    a message that already had calls extracted."""
+    from a piece of text, leaving the prose for display."""
     if not text:
         return text
-    out = RE_XML_TOOL_CALL.sub("", text)
+    out = RE_XML_TOOL_CALL_CLOSED.sub("", text)
+    out = RE_XML_TOOL_CALL_UNCLOSED.sub("", out)
     out = RE_FENCE_JSON.sub("", out)
     return out.strip()

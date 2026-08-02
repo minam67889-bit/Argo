@@ -107,3 +107,36 @@ if __name__ == "__main__":
     test_no_tool_calls()
     print("✓ test_no_tool_calls")
     print("\nAll parser tests passed.")
+
+
+def test_qwen3_unclosed_tool_call():
+    """Qwen3 often emits <tool_call> without closing tag, followed by </think>."""
+    text = '''ated
+
+<tool_call>
+{"name": "read_file", "arguments": {"path": "test.py"}}
+</think>
+
+محتوای فایل `test.py`:
+
+```python
+def add(a, b):
+    return a + b
+```'''
+    calls, rest = parse_tool_calls(text, valid_tools=["read_file", "bash"])
+    assert len(calls) == 1, f"Expected 1 call, got {len(calls)}"
+    assert calls[0].name == "read_file"
+    assert calls[0].arguments == {"path": "test.py"}
+    # The markdown description should remain in the display text
+    assert "محتوای فایل" in rest
+    print("✓ test_qwen3_unclosed_tool_call")
+
+
+def test_json_anywhere_fallback():
+    """When other patterns fail, find a {name, arguments} JSON anywhere in text."""
+    text = 'I will run the tool now: {"name": "bash", "arguments": {"cmd": "ls"}}, and continue.'
+    calls, _ = parse_tool_calls(text, valid_tools=["bash"])
+    assert len(calls) == 1
+    assert calls[0].name == "bash"
+    assert calls[0].arguments == {"cmd": "ls"}
+    print("✓ test_json_anywhere_fallback")

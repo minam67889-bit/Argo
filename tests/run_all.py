@@ -21,6 +21,8 @@ if __name__ == "__main__":
     test_format_tool_result(); print("✓ format_tool_result")
     test_real_world_qwen_output(); print("✓ real_world_qwen_output")
     test_no_tool_calls(); print("✓ no_tool_calls")
+    test_qwen3_unclosed_tool_call(); print("✓ qwen3_unclosed_tool_call")
+    test_json_anywhere_fallback(); print("✓ json_anywhere_fallback")
 
     print("\n=== Tool tests ===")
     from tests.test_tools import run_tests
