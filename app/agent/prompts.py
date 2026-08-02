@@ -53,35 +53,51 @@ All relative paths are resolved under: `{workdir}`. You CANNOT write outside it.
 
 ## How to call a tool — CRITICAL FORMAT
 
-To call a tool, output EXACTLY this XML block (no prose before/after):
+The system supports TWO equivalent tool-call formats. Pick one and use it consistently.
 
+**Format A — Qwen-style XML (preferred when supported):**
 ```
 <tool_call name="TOOL_NAME">{{"arg1": "value1", "arg2": "value2"}}</tool_call>
 ```
 
-**YOU MUST ALWAYS include `name="TOOL_NAME"` in the tag.** Example:
+**Format B — Mistral / Llama-3 pipe-style (use this if Format A is unfamiliar):**
+```
+<|tool_call_name|>{{"name": "TOOL_NAME", "arguments": {{"arg1": "value1", "arg2": "value2"}}}}<|tool_call_end|>
+```
 
+Or the simpler Mistral form:
+```
+<|tool_call|>{{"name": "TOOL_NAME", "arguments": {{"arg1": "value1", "arg2": "value2"}}}}<|/tool_call|>
+```
+
+**Examples (Format A):**
 ```
 <tool_call name="bash">{{"cmd": "ls -la"}}</tool_call>
 <tool_call name="write_file">{{"path": "hello.py", "content": "print('hi')"}}</tool_call>
 ```
 
+**Examples (Format B):**
+```
+<|tool_call|>{{"name": "bash", "arguments": {{"cmd": "ls -la"}}}}<|/tool_call|>
+<|tool_call|>{{"name": "write_file", "arguments": {{"path": "hello.py", "content": "print('hi')"}}}}<|/tool_call|>
+```
+
 To call multiple tools in one turn, emit multiple blocks back to back.
 
-**Do NOT omit the `name="..."` attribute.** The system needs it to know which tool to call.
+**Do NOT omit the `name="..."` (Format A) or `"name": "..."` (Format B).** The system needs it to know which tool to call.
 
 After each tool call you will receive a `<tool_result>` block with the output. Use it to decide your next step.
 
 ## Rules
 
 1. **NEVER make up tool results.** If you didn't get a `<tool_result>` back, the tool hasn't run yet. Wait for the result.
-2. **NEVER describe what a tool would do without actually calling it.** Always emit the `<tool_call>` block first.
+2. **NEVER describe what a tool would do without actually calling it.** Always emit the tool-call block first.
 3. **NEVER claim a file exists unless you got a successful `read_file` or `write_file` result.**
 4. **Explore first**: before editing, run `list_dir` and/or `read_file` to understand the codebase.
 5. **Make small, verifiable changes**: edit, then test. Prefer `edit_file` for surgical changes.
 6. **Be efficient**: don't over-explain. Don't repeat the same failing command.
 7. **Don't loop**: if you find yourself calling the same tool with similar arguments, stop.
-8. **When done**: give a concise final answer in the user's language, WITHOUT any `<tool_call>` block.
+8. **When done**: give a concise final answer in the user's language, WITHOUT any tool-call block.
 9. **Respond in the user's language.**
 
 Today's date: {_today_str()}.

@@ -4,11 +4,13 @@ Tries multiple formats, in order of preference:
   1. <tool_call name="...">{...}</tool_call>  (Qwen-style XML, with optional closing)
   2. <tool_call name="...">{...} </tool_call>```
 
-  3. ```json { "name": "...", "arguments": {...} }```  (generic)
-  4. <tool_code>...```json name/arguments```...</tool_code>  (multi-call)
-  5. ReAct: Action: name \\n Action Input: {json}
-  6. Bare JSON objects with "name"/"arguments" or "name"/"args"
-  7. Qwen3 thinking style: <tool_call>name\n{...} (no closing, until end)
+  3. <|tool_call name="...">{...}</tool_call|>  (Mistral/Llama-3 pipe-style)
+  4. <|tool_call|>...<|tool_call|>  (pipe-style no name, JSON inside)
+  5. ```json { "name": "...", "arguments": {...} }```  (generic)
+  6. <tool_code>...```json name/arguments```...</tool_code>  (multi-call)
+  7. ReAct: Action: name \\n Action Input: {json}
+  8. Bare JSON objects with "name"/"arguments" or "name"/"args"
+  9. Qwen3 thinking style: <tool_call>name\n{...} (no closing, until end)
 
 We never silently drop calls — we always log what we couldn't parse and
 return what we found.
@@ -248,6 +250,30 @@ RE_XML_TOOL_CALL_NONAME = re.compile(
     re.IGNORECASE,
 )
 
+# <|tool_call name="X">{...}</tool_call|>  — Mistral / Llama-3 pipe-style (with closing)
+RE_PIPE_TOOL_CALL_CLOSED = re.compile(
+    r'<\|tool_call\s+name="([^"]+)"\s*>([\s\S]*?)</tool_call\s*\|>',
+    re.IGNORECASE,
+)
+
+# <|tool_call name="X">... — unclosed (until next <|tool_call|> or <think>)
+RE_PIPE_TOOL_CALL_UNCLOSED = re.compile(
+    r'<\|tool_call\s+name="([^"]+)"\s*>([\s\S]*?)(?:<\|tool_call\s*\||</think>|###\s*Observation)',
+    re.IGNORECASE,
+)
+
+# <|tool_call|>{...}</tool_call|> — pipe-style without name, JSON has name inside (closed)
+RE_PIPE_TOOL_CALL_NONAME_CLOSED = re.compile(
+    r'<\|tool_call\s*>([\s\S]*?)</tool_call\s*\|>',
+    re.IGNORECASE,
+)
+
+# <|tool_call|>{json}<|tool_call|> — pipe-style without name, unclosed
+RE_PIPE_TOOL_CALL_NONAME = re.compile(
+    r'<\|tool_call\s*>([\s\S]*?)(?:<\|tool_call\s*\||</think>|###\s*Observation)',
+    re.IGNORECASE,
+)
+
 # ```json { "name": "X", "arguments": {...} }```
 RE_FENCE_JSON = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
 
@@ -325,6 +351,22 @@ def parse_tool_calls(
         tc = ToolCall(name=name, arguments=args, raw=m.group(0))
         _try_add(tc, m.span(), "xml_closed")
 
+    # --- 1b) <|tool_call name="X">{...}</tool_call|>  (Mistral/Llama-3 pipe-style closed) ---
+    if not calls:
+        for m in RE_PIPE_TOOL_CALL_CLOSED.finditer(text):
+            name = m.group(1).strip()
+            args = _parse_args(m.group(2))
+            tc = ToolCall(name=name, arguments=args, raw=m.group(0))
+            _try_add(tc, m.span(), "pipe_closed")
+
+    # --- 1c) <|tool_call name="X">... (pipe-style unclosed, until next <|tool_call|>) ---
+    if not calls:
+        for m in RE_PIPE_TOOL_CALL_UNCLOSED.finditer(text):
+            name = m.group(1).strip()
+            args = _parse_args(m.group(2))
+            tc = ToolCall(name=name, arguments=args, raw=m.group(0))
+            _try_add(tc, m.span(), "pipe_unclosed")
+
     # --- 2) XML <tool_call name="X">...  (unclosed, until </think>) ---
     if not calls:
         for m in RE_XML_TOOL_CALL_UNCLOSED.finditer(text):
@@ -364,6 +406,62 @@ def parse_tool_calls(
                     elif "path" in obj:
                         _try_add(ToolCall(name="read_file", arguments=obj, raw=m.group(0)),
                                  m.span(), "xml_noname_guess_read")
+
+    # --- 3b) <|tool_call|>{json}</tool_call|>  (pipe-style no name, closed) ---
+    if not calls:
+        for m in RE_PIPE_TOOL_CALL_NONAME_CLOSED.finditer(text):
+            inner = m.group(1).strip()
+            obj = _parse_args(inner)
+            name = obj.get("name")
+            if name and isinstance(name, str):
+                args = obj.get("arguments", {}) or {}
+                _try_add(ToolCall(name=name, arguments=args, raw=m.group(0)),
+                         m.span(), "pipe_noname_closed_named")
+            else:
+                tc = _json_block_with_tool_name(inner)
+                if tc is not None:
+                    _try_add(tc, m.span(), "pipe_noname_closed_inferred")
+                else:
+                    if "cmd" in obj:
+                        _try_add(ToolCall(name="bash", arguments=obj, raw=m.group(0)),
+                                 m.span(), "pipe_noname_closed_guess_bash")
+                    elif "content" in obj and "path" in obj:
+                        _try_add(ToolCall(name="write_file", arguments=obj, raw=m.group(0)),
+                                 m.span(), "pipe_noname_closed_guess_write")
+                    elif "old_text" in obj and "new_text" in obj:
+                        _try_add(ToolCall(name="edit_file", arguments=obj, raw=m.group(0)),
+                                 m.span(), "pipe_noname_closed_guess_edit")
+                    elif "path" in obj:
+                        _try_add(ToolCall(name="read_file", arguments=obj, raw=m.group(0)),
+                                 m.span(), "pipe_noname_closed_guess_read")
+
+    # --- 3c) <|tool_call|>{json}<|tool_call|>  (pipe-style no name, unclosed) ---
+    if not calls:
+        for m in RE_PIPE_TOOL_CALL_NONAME.finditer(text):
+            inner = m.group(1).strip()
+            obj = _parse_args(inner)
+            name = obj.get("name")
+            if name and isinstance(name, str):
+                args = obj.get("arguments", {}) or {}
+                _try_add(ToolCall(name=name, arguments=args, raw=m.group(0)),
+                         m.span(), "pipe_noname_named")
+            else:
+                tc = _json_block_with_tool_name(inner)
+                if tc is not None:
+                    _try_add(tc, m.span(), "pipe_noname_inferred")
+                else:
+                    if "cmd" in obj:
+                        _try_add(ToolCall(name="bash", arguments=obj, raw=m.group(0)),
+                                 m.span(), "pipe_noname_guess_bash")
+                    elif "content" in obj and "path" in obj:
+                        _try_add(ToolCall(name="write_file", arguments=obj, raw=m.group(0)),
+                                 m.span(), "pipe_noname_guess_write")
+                    elif "old_text" in obj and "new_text" in obj:
+                        _try_add(ToolCall(name="edit_file", arguments=obj, raw=m.group(0)),
+                                 m.span(), "pipe_noname_guess_edit")
+                    elif "path" in obj:
+                        _try_add(ToolCall(name="read_file", arguments=obj, raw=m.group(0)),
+                                 m.span(), "pipe_noname_guess_read")
 
     # --- 4) <tool_code>...```json name/arguments```...</tool_code> ---
     if not calls:
@@ -418,6 +516,13 @@ def parse_tool_calls(
     return calls, remaining
 
 
+# Incomplete special-token tool calls (e.g. "<|im_start|>tool_call" with no payload)
+RE_INCOMPLETE_PIPE = re.compile(
+    r'<\|im_start\|>tool_call[^<]*$',
+    re.IGNORECASE,
+)
+
+
 def format_tool_result(name: str, output: str, error: bool) -> str:
     """Format a tool result for the model's next turn."""
     status = "error" if error else "ok"
@@ -431,5 +536,10 @@ def strip_tool_blocks(text: str) -> str:
         return text
     out = RE_XML_TOOL_CALL_CLOSED.sub("", text)
     out = RE_XML_TOOL_CALL_UNCLOSED.sub("", out)
+    out = RE_PIPE_TOOL_CALL_CLOSED.sub("", out)
+    out = RE_PIPE_TOOL_CALL_UNCLOSED.sub("", out)
+    out = RE_PIPE_TOOL_CALL_NONAME_CLOSED.sub("", out)
+    out = RE_PIPE_TOOL_CALL_NONAME.sub("", out)
     out = RE_FENCE_JSON.sub("", out)
+    out = RE_INCOMPLETE_PIPE.sub("", out)
     return out.strip()
