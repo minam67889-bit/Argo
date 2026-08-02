@@ -163,28 +163,23 @@ def chat_completions(req: ChatRequest):
 if __name__ == "__main__":
     # Try the requested port; if busy, find a free one
     import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.bind((HOST, PORT))
-        s.close()
-        chosen_port = PORT
-    except OSError:
-        for p in range(PORT + 1, PORT + 100):
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.bind((HOST, p))
-                s.close()
-                chosen_port = p
+    chosen_port = None
+    for p in range(PORT, PORT + 100):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((HOST, p))
+            s.close()
+            chosen_port = p
+            if p != PORT:
                 print(f"[server] port {PORT} busy, using {p} instead", flush=True)
-                break
-            except OSError:
-                continue
-        else:
-            print(f"[server] no free port found near {PORT}!", flush=True)
-            raise SystemExit(1)
+            break
+        except OSError:
+            continue
+    if chosen_port is None:
+        print(f"[server] no free port found near {PORT}!", flush=True)
+        raise SystemExit(1)
     with open('/content/llama.port', 'w') as f:
         f.write(str(chosen_port))
-    # Also write our PID so callers can kill us precisely (avoids pkill -f pattern issues)
     with open('/content/llama.pid', 'w') as f:
         f.write(str(os.getpid()))
     print(f"[server] PID: {os.getpid()}, port: {chosen_port}", flush=True)
