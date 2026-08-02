@@ -36,6 +36,7 @@ class LLMClient:
         messages: List[Dict[str, Any]],
         model: Optional[str] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
         stream: bool = False,
         tools: Optional[List[Dict[str, Any]]] = None,
@@ -50,6 +51,7 @@ class LLMClient:
             "model": model or settings.LLM_MODEL,
             "messages": messages,
             "temperature": temperature if temperature is not None else settings.AGENT_TEMPERATURE,
+            "top_p": top_p if top_p is not None else 0.9,
             "max_tokens": max_tokens or settings.AGENT_MAX_TOKENS,
             "stream": False,
         }
@@ -96,6 +98,7 @@ class LLMClient:
         messages: List[Dict[str, Any]],
         model: Optional[str] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Any] = None,
@@ -113,6 +116,7 @@ class LLMClient:
             "model": model or settings.LLM_MODEL,
             "messages": messages,
             "temperature": temperature if temperature is not None else settings.AGENT_TEMPERATURE,
+            "top_p": top_p if top_p is not None else 0.9,
             "max_tokens": max_tokens or settings.AGENT_MAX_TOKENS,
             "stream": True,
         }

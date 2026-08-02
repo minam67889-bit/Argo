@@ -179,8 +179,34 @@ def parse_tool_calls(
     # --- 3) XML <tool_call>{json}</tool_call> (no name attribute) ---
     if not calls:
         for m in RE_XML_TOOL_CALL_NONAME.finditer(text):
-            tc = _json_block_with_tool_name(m.group(1))
-            _try_add(tc, m.span(), "xml_noname")
+            inner = m.group(1).strip()
+            # Try to find a JSON object with "name" in the inner content
+            obj = _parse_args(inner)
+            name = obj.get("name")
+            if name and isinstance(name, str):
+                # Has name — use it
+                args = obj.get("arguments", {}) or {}
+                _try_add(ToolCall(name=name, arguments=args, raw=m.group(0)),
+                         m.span(), "xml_noname_named")
+            else:
+                # No name — try JSON-anywhere heuristic: find {with path/content/cmd}
+                tc = _json_block_with_tool_name(inner)
+                if tc is not None:
+                    _try_add(tc, m.span(), "xml_noname_inferred")
+                else:
+                    # Last resort: if JSON has 'cmd', it's bash; 'path' alone could be anything
+                    if "cmd" in obj:
+                        _try_add(ToolCall(name="bash", arguments=obj, raw=m.group(0)),
+                                 m.span(), "xml_noname_guess_bash")
+                    elif "content" in obj and "path" in obj:
+                        _try_add(ToolCall(name="write_file", arguments=obj, raw=m.group(0)),
+                                 m.span(), "xml_noname_guess_write")
+                    elif "old_text" in obj and "new_text" in obj:
+                        _try_add(ToolCall(name="edit_file", arguments=obj, raw=m.group(0)),
+                                 m.span(), "xml_noname_guess_edit")
+                    elif "path" in obj:
+                        _try_add(ToolCall(name="read_file", arguments=obj, raw=m.group(0)),
+                                 m.span(), "xml_noname_guess_read")
 
     # --- 4) <tool_code>...```json name/arguments```...</tool_code> ---
     if not calls:

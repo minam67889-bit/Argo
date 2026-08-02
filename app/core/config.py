@@ -46,7 +46,7 @@ class Settings:
 
     # --- Agent behavior ---
     AGENT_MAX_STEPS: int = _env_int("AGENT_MAX_STEPS", 40)
-    AGENT_TEMPERATURE: float = _env_float("AGENT_TEMPERATURE", 0.2)
+    AGENT_TEMPERATURE: float = _env_float("AGENT_TEMPERATURE", 0.1)
     AGENT_MAX_TOKENS: int = _env_int("AGENT_MAX_TOKENS", 8192)
     AGENT_CONTEXT_WINDOW: int = _env_int("AGENT_CONTEXT_WINDOW", 24000)
     AGENT_AUTO_APPROVE: bool = _env_bool("AGENT_AUTO_APPROVE", False)
