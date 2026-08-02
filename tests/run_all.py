@@ -11,6 +11,7 @@ if __name__ == "__main__":
         test_unknown_tool_filtered, test_multiple_calls_in_text,
         test_strip_tool_blocks, test_format_tool_result,
         test_real_world_qwen_output, test_no_tool_calls,
+        test_qwen3_unclosed_tool_call, test_json_anywhere_fallback,
     )
     test_xml_format(); print("✓ xml_format")
     test_fenced_json_format(); print("✓ fenced_json_format")
